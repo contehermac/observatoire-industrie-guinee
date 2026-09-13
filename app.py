@@ -272,7 +272,10 @@ def carte_kpi(cartes):
 # =====================================================================
 #  2. DONNEES
 # =====================================================================
-FICHIER = "jeu_donnees_industrie_guinee_nettoye.xlsx"
+# Le portail lit desormais l'ENTREPOT DE DONNEES (schema en etoile) et non
+# plus directement le fichier Excel : la couche de stockage de l'architecture
+# est ainsi reellement traversee. L'entrepot est construit par etl_observatoire.py.
+ENTREPOT = "observatoire.db"
 
 LIBELLES = {
     "nb_entreprises_actives": "Entreprises actives",
@@ -309,18 +312,11 @@ DIMENSIONS = {
 }
 
 
-# Convention territoriale : rattachement des 8 regions administratives aux
-# 4 regions naturelles. Faranah est un cas limite (sa prefecture de Kissidougou
-# est parfois rattachee a la Guinee forestiere) : la convention est explicitee
-# dans la page « L'Observatoire ».
-REGIONS_NATURELLES = {
-    "Conakry": "Basse-Guinee", "Boké": "Basse-Guinee", "Kindia": "Basse-Guinee",
-    "Labé": "Moyenne-Guinee", "Mamou": "Moyenne-Guinee",
-    "Kankan": "Haute-Guinee", "Faranah": "Haute-Guinee",
-    "Nzérékoré": "Guinee forestiere",
-}
-ORDRE_NATUREL = ["Basse-Guinee", "Moyenne-Guinee", "Haute-Guinee",
-                 "Guinee forestiere"]
+# Convention territoriale : le rattachement des 8 regions administratives aux
+# 4 regions naturelles n'est plus code ici. Il est porte par la table de
+# dimension Dim_Region de l'entrepot, et lu avec les donnees (voir plus bas).
+ORDRE_NATUREL = ["Basse-Guinée", "Moyenne-Guinée", "Haute-Guinée",
+                 "Guinée forestière"]
 
 
 # Colonnes indispensables au fonctionnement du portail
@@ -335,14 +331,29 @@ def empreinte(chemin):
     return (p.stat().st_size, p.stat().st_mtime) if p.exists() else None
 
 
+REQUETE_ENTREPOT = """
+    SELECT da.annee            AS annee,
+           dr.libelle_region   AS region,
+           dr.region_naturelle AS region_naturelle,
+           ds.libelle_secteur  AS secteur_industriel,
+           f.*
+    FROM Fait_industrie f
+    JOIN Dim_Region  dr ON dr.id_region  = f.id_region
+    JOIN Dim_Secteur ds ON ds.id_secteur = f.id_secteur
+    JOIN Dim_Annee   da ON da.id_annee   = f.id_annee;
+"""
+
+
 @st.cache_data
 def charger_donnees(chemin, _empreinte):
-    d = pd.read_excel(chemin)
-    d.columns = [str(c).strip() for c in d.columns]
-    if "region" in d.columns:
-        d["region_naturelle"] = (d["region"].map(REGIONS_NATURELLES)
-                                 .fillna("Region non rattachee"))
-    return d
+    """Lit l'entrepot : la table de faits jointe a ses trois dimensions.
+    Le resultat a exactement la meme forme que l'ancien fichier a plat, de
+    sorte que le reste du portail est inchange."""
+    import sqlite3
+    con = sqlite3.connect(chemin)
+    d = pd.read_sql_query(REQUETE_ENTREPOT, con)
+    con.close()
+    return d.drop(columns=["id_region", "id_secteur", "id_annee"])
 
 
 def formater(n):
@@ -396,12 +407,17 @@ def bloc_simandou():
             '</div>', unsafe_allow_html=True)
 
 
-if not Path(FICHIER).exists():
-    st.error(f"Fichier de donnees introuvable : « {FICHIER} ». "
-             "Placez-le dans le meme dossier que app.py, sous ce nom exact.")
+if not Path(ENTREPOT).exists():
+    st.error(f"Entrepot de donnees introuvable : « {ENTREPOT} ». "
+             "Construisez-le en lancant `python etl_observatoire.py` dans ce "
+             "dossier, puis relancez le portail.")
     st.stop()
 
-df = charger_donnees(FICHIER, empreinte(FICHIER))
+df = charger_donnees(ENTREPOT, empreinte(ENTREPOT))
+
+# La convention territoriale est lue dans l'entrepot, pas redefinie ici.
+REGIONS_NATURELLES = (df[["region", "region_naturelle"]].drop_duplicates()
+                      .set_index("region")["region_naturelle"].to_dict())
 
 _manquantes = [c for c in COLONNES_REQUISES if c not in df.columns]
 if _manquantes:
@@ -609,11 +625,9 @@ def page_presentation():
          "Regions administratives": ", ".join(
              sorted(r for r, v in REGIONS_NATURELLES.items() if v == rn))}
         for rn in ORDRE_NATUREL]), use_container_width=True, hide_index=True)
-    st.caption("Le rattachement de la region de Faranah constitue un cas limite : "
-               "sa prefecture de Kissidougou est parfois rattachee a la Guinee "
-               "forestiere. Elle est ici comptabilisee en Haute-Guinee ; cette "
-               "convention est appliquee de maniere uniforme a l'ensemble des "
-               "analyses du portail.")
+    st.caption("Ce rattachement est applique de maniere uniforme a l'ensemble "
+               "des analyses du portail. Il est porte par la table de dimension "
+               "Dim_Region de l'entrepot de donnees.")
 
     section("Sources de donnees")
     st.markdown(
@@ -644,10 +658,22 @@ def page_presentation():
                "dans l'architecture, sans constituer un dispositif de securite de "
                "niveau production.")
 
-    st.warning("**Note methodologique** — Les donnees de ce portail sont issues d'un "
-               "jeu synthetique construit pour la demonstration du prototype "
-               "(240 observations, 8 regions, 6 secteurs, 2021-2025). Elles ne "
+    st.warning("**Note methodologique** — Ce portail est un prototype academique "
+               "realise dans le cadre d'un memoire de Master. Il ne constitue pas "
+               "un site officiel de la Republique de Guinee. Les donnees affichees "
+               "sont issues d'un jeu synthetique construit pour la demonstration "
+               "(240 observations, 8 regions, 6 secteurs, 2021-2025) et ne "
                "constituent pas des statistiques officielles.")
+
+    section("Chaine de traitement")
+    st.write(
+        "Les donnees affichees ne sont pas lues dans un fichier : elles sont "
+        "extraites d'un **entrepot de donnees** structure en schema en etoile "
+        "(une table de faits au grain region x secteur x annee, reliee aux "
+        "dimensions Region, Secteur et Annee). Cet entrepot est alimente par une "
+        "chaine ETL qui extrait le fichier source brut, le nettoie et le charge. "
+        "Les quatre couches de l'architecture — collecte, pretraitement, stockage "
+        "et diffusion — sont donc effectivement traversees a chaque consultation.")
 
 
 # =====================================================================
@@ -983,4 +1009,7 @@ def page_donnees():
 st.sidebar.divider()
 st.sidebar.caption("Observatoire National de l'Industrie de Guinee  \n"
                    "Memoire M2 SID — Ansoumane CONTE  \n"
-                   "Universite Alioune Diop de Bambey")
+                   "Universite Alioune Diop de Bambey  \n"
+                   "  \n"
+                   "**Prototype academique** — ne constitue pas un site officiel "
+                   "de la Republique de Guinee. Donnees de demonstration.")
